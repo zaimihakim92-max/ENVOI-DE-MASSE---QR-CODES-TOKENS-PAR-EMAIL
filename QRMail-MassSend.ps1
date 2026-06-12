@@ -357,23 +357,40 @@ $btnModele.Location = '760,0'; $btnModele.Size = '100,22'
 $btnModele.Font = New-Object System.Drawing.Font("Segoe UI", 8)
 $grpPrev.Controls.Add($btnModele)
 
-# --- ListBox des destinataires (gauche) -----------------------------------------
-$listbox = New-Object System.Windows.Forms.ListBox
+# --- CheckedListBox des destinataires (gauche) - REDIMENSIONNABLE ---
+$listbox = New-Object System.Windows.Forms.CheckedListBox
 $listbox.Location = '10,22'; $listbox.Size = '250,295'
-$listbox.SelectionMode = 'One'
 $listbox.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $listbox.IntegralHeight = $false
+$listbox.CheckOnClick = $true   # Cocher en cliquant directement sur la case
 $grpPrev.Controls.Add($listbox)
+
+$listbox.Add_ItemCheck({
+    # Mettre à jour le compteur quand on (dé)coche
+    $nbCoches = 0
+    for ($i = 0; $i -lt $listbox.Items.Count; $i++) {
+        if ($listbox.GetItemChecked($i)) { $nbCoches++ }
+    }
+    if ($nbCoches -eq 0) {
+        $btnSendAll.Text = "Envoyer tous les mails"
+    } else {
+        $btnSendAll.Text = "Envoyer $nbCoches mail(s) cochés"
+    }
+})
 
 $listbox.Add_SelectedIndexChanged({
     if ($listbox.SelectedIndex -ge 0) {
         $script:index = $listbox.SelectedIndex
+        [System.Windows.Forms.Application]::DoEvents()
         Show-Apercu
     }
 })
 
 # Sauvegarder la référence de l'événement pour pouvoir le déconnecter dans Update-ListboxItemStatus
 $script:listboxEventHandler = $listbox.SelectedIndexChanged.GetInvocationList()[-1]
+$script:splitterX = 267
+$script:splitterIsDragging = $false
+$script:splitterStartX = 0
 
 # --- Préviz HTML du mail sélectionné (droite) ------------------------------------
 $web = New-Object System.Windows.Forms.WebBrowser
@@ -384,6 +401,40 @@ $web.IsWebBrowserContextMenuEnabled = $false
 $web.WebBrowserShortcutsEnabled = $false
 $web.ScriptErrorsSuppressed = $true
 $grpPrev.Controls.Add($web)
+
+# Redimensionnement par drag-and-drop sur la limite entre ListBox et WebBrowser
+$grpPrev.Add_MouseDown({
+    param($sender, $e)
+    if ($e.X -ge 265 -and $e.X -le 275 -and $e.Y -ge 22 -and $e.Y -le 295) {
+        $script:splitterIsDragging = $true
+        $script:splitterStartX = $e.X
+    }
+})
+
+$grpPrev.Add_MouseMove({
+    param($sender, $e)
+    if ($e.X -ge 265 -and $e.X -le 275 -and $e.Y -ge 22 -and $e.Y -le 295) {
+        $grpPrev.Cursor = [System.Windows.Forms.Cursors]::VSplit
+    } else {
+        $grpPrev.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
+
+    if ($script:splitterIsDragging) {
+        $deltaX = $e.X - $script:splitterStartX
+        $newX = [Math]::Max(100, [Math]::Min(750, $script:splitterX + $deltaX))
+        $listbox.Size = New-Object System.Drawing.Size($newX - 10, 295)
+        $web.Location = New-Object System.Drawing.Point($newX + 6, 22)
+        $web.Size = New-Object System.Drawing.Size((865 - $newX - 16), 295)
+        $grpPrev.Refresh()
+    }
+})
+
+$grpPrev.Add_MouseUp({
+    if ($script:splitterIsDragging) {
+        $script:splitterX = $listbox.Width + 10
+        $script:splitterIsDragging = $false
+    }
+})
 
 # -------------------------------------------------------------- Boutons d'action (refactorisés)
 $btnStart = New-Object System.Windows.Forms.Button
@@ -826,23 +877,26 @@ $btnStart.Add_Click({
     $script:stats              = @{ OK = 0; KO = 0; Passes = 0 }
     $script:envoiEffectues     = @()    # réinitialise la liste des envois
     
-    # Peuple la ListBox avec tous les destinataires (sans déclencher SelectedIndexChanged)
+    # Peuple la CheckedListBox avec tous les destinataires (sans déclencher SelectedIndexChanged)
     for ($i = 0; $i -lt $script:donnees.Count; $i++) {
         $script:index = $i
         $c = Get-ChampsLigne
         $qrOk = (-not [string]::IsNullOrWhiteSpace($c.CheminQR)) -and (Test-Path $c.CheminQR)
         $etat = if ($qrOk) { "✓" } else { "✗" }
         $itemText = "[$($i+1)] $($c.Email) - $etat"
-        $listbox.Items.Add($itemText)
+        $listbox.Items.Add($itemText, $true)   # $true = cocher par défaut
     }
 
-    Write-Log "--- Prévisualisations chargées : $($script:donnees.Count) destinataire(s) ---"
+    Write-Log "--- Prévisualisations chargées : $($script:donnees.Count) destinataire(s) (tous cochés) ---"
     $btnStart.Enabled = $false
     $btnSendAll.Enabled = $true
+    $btnSendAll.Text = "Envoyer $($script:donnees.Count) mail(s) cochés"
     
-    # Affiche la première préviz
+    # Affiche la première préviz en forçant le rafraîchissement
     $script:index = 0
+    [System.Windows.Forms.Application]::DoEvents()
     $listbox.SelectedIndex = 0
+    Show-Apercu
 })
 
 # --- Envoyer tous les mails -------------------------------------------------------
@@ -861,6 +915,12 @@ $btnSendAll.Add_Click({
     $script:envoiEffectues = @()    # réinitialise pour cette campagne d'envoi
 
     for ($i = 0; $i -lt $script:donnees.Count; $i++) {
+        # IMPORTANT : envoyer SEULEMENT si l'utilisateur est coché
+        if (-not $listbox.GetItemChecked($i)) {
+            Write-Log "[$($i+1)] PASSÉ (non coché)"
+            continue
+        }
+
         $script:index = $i
         $c = Get-ChampsLigne
         $num = $i + 1
