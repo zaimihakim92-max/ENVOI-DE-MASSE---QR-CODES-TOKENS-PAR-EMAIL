@@ -1,0 +1,457 @@
+<#
+================================================================================
+                 ENVOI DE MASSE - QR CODES TOKENS PAR EMAIL
+                  (avec prévisualisation avant chaque envoi)
+================================================================================
+
+  OBJECTIF
+  --------
+  À partir du CSV enrichi produit par le générateur de QR codes
+  (colonnes : Nom ; Email ; Token ; CheminQR), ce script :
+      - identifie l'adresse email de chaque ligne
+      - récupère l'image QR correspondante (colonne CheminQR)
+      - l'injecte dans le corps du mail (image INLINE, pas une simple PJ)
+      - affiche une PRÉVISUALISATION fidèle de chaque mail
+      - n'envoie qu'après validation (mail par mail, ou mode auto)
+
+  SCHÉMA DE FONCTIONNEMENT
+  ------------------------
+
+      ┌──────────────────────────┐
+      │  CSV enrichi  (;)        │   Nom ; Email ; ... ; CheminQR
+      └────────────┬─────────────┘
+                   │  [GUI] chargement + mapping colonnes Email / Nom / CheminQR
+                   ▼
+      ┌──────────────────────────┐
+      │  Paramètres SMTP         │   serveur / port / SSL / expéditeur
+      │  (laissés VIERGES,       │   + identifiants optionnels
+      │   à renseigner)          │
+      └────────────┬─────────────┘
+                   ▼
+      ┌──────────────────────────┐
+      │  File d'attente          │   1 destinataire = 1 mail
+      └────────────┬─────────────┘
+                   ▼
+      ┌──────────────────────────┐     [Envoyer]      ┌──────────────────┐
+      │  PRÉVISUALISATION        │───────────────────▶│  SMTP (inline    │
+      │  destinataire / objet /  │     [Passer]       │  cid: QR code)   │
+      │  corps HTML + QR affiché │──────┐             └──────────────────┘
+      └────────────┬─────────────┘      │
+                   │ [Tout envoyer]     ▼
+                   ▼              destinataire suivant
+      ┌──────────────────────────┐
+      │  Journal + bilan final   │   OK / échec / passés
+      └──────────────────────────┘
+
+  MODES D'ENVOI
+  -------------
+  - "Envoyer"            : envoie le mail affiché, passe au suivant
+  - "Passer"             : ignore le destinataire affiché, passe au suivant
+  - "Tout envoyer"       : envoie tous les mails RESTANTS sans nouvelle
+                           confirmation (à utiliser après avoir validé
+                           quelques prévisualisations)
+
+  POINTS DE SÉCURITÉ
+  ------------------
+  - Le QR est injecté en image inline (Content-ID) : le secret ne transite
+    que vers le destinataire concerné, une seule image par mail.
+  - Le mot de passe SMTP éventuel est saisi en champ masqué et converti en
+    PSCredential ; il n'est jamais écrit sur disque ni dans le journal.
+  - Anti-erreur d'aiguillage : contrôle de cohérence avant chaque envoi
+    (email non vide + fichier QR existant), sinon mise en échec et passage
+    au suivant.
+  - Pause configurable entre deux envois (mode "Tout envoyer") pour ne pas
+    déclencher les seuils anti-spam / throttling du serveur.
+
+  PRÉREQUIS
+  ---------
+  - Windows PowerShell 5.1 ou PowerShell 7+ (Windows)
+  - Un serveur SMTP joignable et un compte autorisé à émettre
+    (relais interne, connecteur dédié, etc.)
+  - Le CSV enrichi ET les images QR encore présents sur le disque
+    (ne pas purger avant la fin de la campagne !)
+================================================================================
+#>
+
+# ==============================================================================
+# CONFIGURATION - MODÈLE DU MAIL (personnalisable)
+# ==============================================================================
+
+# Chemin de l'IMAGE DE SIGNATURE (logo, bannière de service, signature scannée...)
+# - Renseignez un chemin complet, ex : "C:\Outils\signature.png"
+# - Laissez vide ("") pour ne pas inclure de signature.
+# L'image est injectée en INLINE (cid:) comme le QR : elle s'affiche dans le
+# corps du mail sans apparaître comme pièce jointe à ouvrir.
+$CheminSignature = ""
+
+# Largeur d'affichage de la signature dans le mail (en pixels)
+$LargeurSignaturePx = 300
+
+# Objet du mail. {NOM} sera remplacé par le nom du destinataire.
+$ModeleObjet = "Votre code d'activation personnel"
+
+# Corps HTML. Variables disponibles :
+#   {NOM}        -> nom du destinataire
+#   {QR}         -> emplacement où l'image QR est injectée (NE PAS SUPPRIMER)
+#   {SIGNATURE}  -> emplacement de l'image de signature (retirée automatiquement
+#                   si $CheminSignature est vide ou si le fichier est introuvable)
+$ModeleCorps = @"
+<html>
+<body style="font-family: Segoe UI, Arial, sans-serif; color:#222; max-width:600px;">
+  <p>Bonjour {NOM},</p>
+  <p>Veuillez trouver ci-dessous votre code QR personnel d'activation.</p>
+  <p>Scannez-le avec l'application prévue à cet effet :</p>
+  <p style="text-align:center; margin:25px 0;">{QR}</p>
+  <p>Ce code est strictement personnel : ne le transférez à personne.</p>
+  <p>En cas de difficulté, contactez le support informatique.</p>
+  <p>Cordialement,<br/>Le support informatique</p>
+  <p style="margin-top:20px;">{SIGNATURE}</p>
+</body>
+</html>
+"@
+
+# Pause entre deux envois en mode "Tout envoyer" (en millisecondes)
+$PauseEntreEnvoisMs = 1500
+
+# ==============================================================================
+# CHARGEMENT DES ASSEMBLIES GUI
+# ==============================================================================
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+# ==============================================================================
+# 1. FONCTIONS
+# ==============================================================================
+
+function Send-QRMail {
+    <#
+        Envoie UN mail avec le QR code en image inline (Content-ID).
+        Utilise System.Net.Mail.SmtpClient (et non Send-MailMessage) car
+        c'est le seul moyen propre d'embarquer une image inline via cid:.
+
+        Retourne $true si l'envoi a réussi, sinon lève une exception
+        (interceptée par l'appelant pour journalisation).
+    #>
+    param(
+        [string]$Serveur,
+        [int]$Port,
+        [bool]$UtiliserSSL,
+        [pscredential]$Credential,   # $null = authentification Windows intégrée (relais AD)
+        [string]$Expediteur,
+        [string]$Destinataire,
+        [string]$Objet,
+        [string]$CorpsHtml,          # doit contenir le marqueur {QR}
+        [string]$CheminQR
+    )
+
+    # --- Construction du corps : {QR} devient <img cid:...>, {SIGNATURE} idem ---
+    # IMPORTANT : Content-ID UNIQUE par mail (GUID). Avec un CID fixe, certains
+    # clients (Outlook en vue conversation) mettent l'image en cache et
+    # réaffichent le PREMIER QR reçu dans tous les mails suivants.
+    $cidQR  = "qr-"  + [guid]::NewGuid().ToString("N")
+    $cidSig = "sig-" + [guid]::NewGuid().ToString("N")
+    $html   = $CorpsHtml -replace '\{QR\}', "<img src=""cid:$cidQR"" alt=""QR code"" style=""width:280px;height:280px;"" />"
+
+    # Signature : injectée seulement si le fichier existe, sinon le marqueur est retiré
+    $sigOk  = (-not [string]::IsNullOrWhiteSpace($script:CheminSignature)) -and (Test-Path $script:CheminSignature)
+    if ($sigOk) {
+        $html = $html -replace '\{SIGNATURE\}', "<img src=""cid:$cidSig"" alt=""Signature"" style=""width:$($script:LargeurSignaturePx)px;"" />"
+    } else {
+        $html = $html -replace '\{SIGNATURE\}', ""
+    }
+
+    $mail = New-Object System.Net.Mail.MailMessage
+    $mail.From       = New-Object System.Net.Mail.MailAddress($Expediteur)
+    $mail.Subject    = $Objet
+    $mail.IsBodyHtml = $true
+    $mail.To.Add($Destinataire) | Out-Null
+
+    # --- Vue HTML + ressources liées (QR + signature, référencées par Content-ID) ---
+    $vue = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString(
+        $html, $null, [System.Net.Mime.MediaTypeNames+Text]::Html)
+
+    $ressource = New-Object System.Net.Mail.LinkedResource($CheminQR, "image/png")
+    $ressource.ContentId = $cidQR
+    $ressource.TransferEncoding = [System.Net.Mime.TransferEncoding]::Base64
+    $vue.LinkedResources.Add($ressource)
+
+    $ressourceSig = $null
+    if ($sigOk) {
+        # Type MIME déduit de l'extension (png/jpg/gif pris en charge)
+        $mime = switch ([IO.Path]::GetExtension($script:CheminSignature).ToLower()) {
+            '.jpg'  { 'image/jpeg' }
+            '.jpeg' { 'image/jpeg' }
+            '.gif'  { 'image/gif'  }
+            default { 'image/png'  }
+        }
+        $ressourceSig = New-Object System.Net.Mail.LinkedResource($script:CheminSignature, $mime)
+        $ressourceSig.ContentId = $cidSig
+        $ressourceSig.TransferEncoding = [System.Net.Mime.TransferEncoding]::Base64
+        $vue.LinkedResources.Add($ressourceSig)
+    }
+
+    $mail.AlternateViews.Add($vue)
+
+    # --- Client SMTP ---
+    $smtp = New-Object System.Net.Mail.SmtpClient($Serveur, $Port)
+    $smtp.EnableSsl = $UtiliserSSL
+    if ($Credential) {
+        # Compte explicite (ex: compte de service)
+        $smtp.Credentials = $Credential.GetNetworkCredential()
+    } else {
+        # Authentification Windows intégrée : utilise le compte AD de la session
+        # (cas typique d'un relais SMTP interne autorisant le compte machine/utilisateur)
+        $smtp.UseDefaultCredentials = $true
+    }
+
+    try {
+        $smtp.Send($mail)
+        return $true
+    }
+    finally {
+        # Libération systématique des ressources (fichiers verrouillés sinon)
+        $ressource.Dispose()
+        if ($ressourceSig) { $ressourceSig.Dispose() }
+        $vue.Dispose()
+        $mail.Dispose()
+        $smtp.Dispose()
+    }
+}
+
+function Find-Column {
+    <# Auto-détection d'une colonne par liste de motifs regex (ordre = priorité). #>
+    param([string[]]$Colonnes, [string[]]$MotsCles)
+    foreach ($mc in $MotsCles) {
+        $match = $Colonnes | Where-Object { $_ -match $mc } | Select-Object -First 1
+        if ($match) { return $match }
+    }
+    return $null
+}
+
+# ==============================================================================
+# 2. CONSTRUCTION DE L'INTERFACE
+# ==============================================================================
+$form                 = New-Object System.Windows.Forms.Form
+$form.Text            = "Envoi de masse - QR codes par email"
+$form.Size            = New-Object System.Drawing.Size(900, 720)
+$form.StartPosition   = "CenterScreen"
+$form.FormBorderStyle = "FixedDialog"
+$form.MaximizeBox     = $false
+$form.Font            = New-Object System.Drawing.Font("Segoe UI", 9)
+
+# ------------------------------------------------------------------ CSV enrichi
+$lblCsv = New-Object System.Windows.Forms.Label
+$lblCsv.Text = "1. CSV enrichi (avec colonne CheminQR) :"
+$lblCsv.Location = '15,12'; $lblCsv.AutoSize = $true
+$form.Controls.Add($lblCsv)
+
+$txtCsv = New-Object System.Windows.Forms.TextBox
+$txtCsv.Location = '15,33'; $txtCsv.Size = '650,25'; $txtCsv.ReadOnly = $true
+$form.Controls.Add($txtCsv)
+
+$btnCsv = New-Object System.Windows.Forms.Button
+$btnCsv.Text = "Parcourir..."
+$btnCsv.Location = '675,31'; $btnCsv.Size = '95,27'
+$form.Controls.Add($btnCsv)
+
+$lblCount = New-Object System.Windows.Forms.Label
+$lblCount.Text = "Aucun fichier chargé."
+$lblCount.Location = '780,36'; $lblCount.AutoSize = $true
+$lblCount.ForeColor = [System.Drawing.Color]::Gray
+$form.Controls.Add($lblCount)
+
+# ------------------------------------------------------------- Mapping colonnes
+$grpMap = New-Object System.Windows.Forms.GroupBox
+$grpMap.Text = "2. Mapping des colonnes"
+$grpMap.Location = '15,65'; $grpMap.Size = '420,85'
+$form.Controls.Add($grpMap)
+
+$combos = @{}
+$mapDefs = @(
+    @{ Cle = 'Email';    Libelle = 'Email :';      X = 10  },
+    @{ Cle = 'Nom';      Libelle = 'Nom :';        X = 145 },
+    @{ Cle = 'CheminQR'; Libelle = 'Chemin QR :';  X = 280 }
+)
+foreach ($d in $mapDefs) {
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $d.Libelle; $lbl.AutoSize = $true
+    $lbl.Location = New-Object System.Drawing.Point($d.X, 22)
+    $cmb = New-Object System.Windows.Forms.ComboBox
+    $cmb.DropDownStyle = 'DropDownList'; $cmb.Size = '125,25'
+    $cmb.Location = New-Object System.Drawing.Point($d.X, 44)
+    $grpMap.Controls.Add($lbl); $grpMap.Controls.Add($cmb)
+    $combos[$d.Cle] = $cmb
+}
+
+# -------------------------------------------------------------- Paramètres SMTP
+$grpSmtp = New-Object System.Windows.Forms.GroupBox
+$grpSmtp.Text = "3. Paramètres SMTP (à renseigner)"
+$grpSmtp.Location = '445,65'; $grpSmtp.Size = '435,150'
+$form.Controls.Add($grpSmtp)
+
+# Serveur SMTP -- LAISSÉ VIERGE volontairement
+$lblSrv = New-Object System.Windows.Forms.Label
+$lblSrv.Text = "Serveur :"; $lblSrv.Location = '10,25'; $lblSrv.AutoSize = $true
+$grpSmtp.Controls.Add($lblSrv)
+$txtSrv = New-Object System.Windows.Forms.TextBox
+$txtSrv.Location = '70,22'; $txtSrv.Size = '200,25'
+$txtSrv.Text = ""                                   # <-- serveur SMTP : VIERGE
+$grpSmtp.Controls.Add($txtSrv)
+
+$lblPort = New-Object System.Windows.Forms.Label
+$lblPort.Text = "Port :"; $lblPort.Location = '280,25'; $lblPort.AutoSize = $true
+$grpSmtp.Controls.Add($lblPort)
+$txtPort = New-Object System.Windows.Forms.TextBox
+$txtPort.Location = '320,22'; $txtPort.Size = '50,25'
+$txtPort.Text = "25"                                # 25 = relais interne classique (587 si soumission authentifiée)
+$grpSmtp.Controls.Add($txtPort)
+
+$chkSsl = New-Object System.Windows.Forms.CheckBox
+$chkSsl.Text = "SSL/TLS"; $chkSsl.Location = '375,23'; $chkSsl.AutoSize = $true
+$grpSmtp.Controls.Add($chkSsl)
+
+# Expéditeur -- LAISSÉ VIERGE volontairement
+$lblFrom = New-Object System.Windows.Forms.Label
+$lblFrom.Text = "Expéditeur :"; $lblFrom.Location = '10,55'; $lblFrom.AutoSize = $true
+$grpSmtp.Controls.Add($lblFrom)
+$txtFrom = New-Object System.Windows.Forms.TextBox
+$txtFrom.Location = '85,52'; $txtFrom.Size = '285,25'
+$txtFrom.Text = ""                                  # <-- adresse expéditeur : VIERGE
+$grpSmtp.Controls.Add($txtFrom)
+
+# Authentification : Windows intégrée (défaut, adaptée à un relais AD interne)
+# ou compte explicite (utilisateur + mot de passe masqué)
+$chkAuth = New-Object System.Windows.Forms.CheckBox
+$chkAuth.Text = "Compte explicite (sinon : authentification Windows intégrée / AD)"
+$chkAuth.Location = '10,84'; $chkAuth.AutoSize = $true
+$grpSmtp.Controls.Add($chkAuth)
+
+$txtUser = New-Object System.Windows.Forms.TextBox
+$txtUser.Location = '10,108'; $txtUser.Size = '175,25'; $txtUser.Enabled = $false
+$grpSmtp.Controls.Add($txtUser)
+$txtPass = New-Object System.Windows.Forms.TextBox
+$txtPass.Location = '195,108'; $txtPass.Size = '175,25'; $txtPass.Enabled = $false
+$txtPass.UseSystemPasswordChar = $true              # saisie masquée
+$grpSmtp.Controls.Add($txtPass)
+$lblUser = New-Object System.Windows.Forms.Label
+$lblUser.Text = "(utilisateur / mot de passe)"; $lblUser.Location = '10,136'; $lblUser.AutoSize = $true
+$lblUser.ForeColor = [System.Drawing.Color]::Gray
+$grpSmtp.Controls.Add($lblUser)
+
+$chkAuth.Add_CheckedChanged({
+    $txtUser.Enabled = $chkAuth.Checked
+    $txtPass.Enabled = $chkAuth.Checked
+})
+
+# ------------------------------------------------------------- Prévisualisation (refactorisée)
+$grpPrev = New-Object System.Windows.Forms.GroupBox
+$grpPrev.Text = "4. Prévisualisation de tous les mails - sélectionne un destinataire dans la liste"
+$grpPrev.Location = '15,222'; $grpPrev.Size = '865,330'
+$form.Controls.Add($grpPrev)
+
+# Bouton d'édition du modèle de mail (en haut à droite du groupe)
+$btnModele = New-Object System.Windows.Forms.Button
+$btnModele.Text = "Modifier le modèle..."
+$btnModele.Location = '760,0'; $btnModele.Size = '100,22'
+$btnModele.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+$grpPrev.Controls.Add($btnModele)
+
+# --- ListBox des destinataires (gauche) -----------------------------------------
+$listbox = New-Object System.Windows.Forms.ListBox
+$listbox.Location = '10,22'; $listbox.Size = '250,295'
+$listbox.SelectionMode = 'One'
+$listbox.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$listbox.IntegralHeight = $false
+$grpPrev.Controls.Add($listbox)
+
+$listbox.Add_SelectedIndexChanged({
+    if ($listbox.SelectedIndex -ge 0) {
+        $script:index = $listbox.SelectedIndex
+        Show-Apercu
+    }
+})
+
+# Sauvegarder la référence de l'événement pour pouvoir le déconnecter dans Update-ListboxItemStatus
+$script:listboxEventHandler = $listbox.SelectedIndexChanged.GetInvocationList()[-1]
+
+# --- Préviz HTML du mail sélectionné (droite) ------------------------------------
+$web = New-Object System.Windows.Forms.WebBrowser
+$web.Location = '270,22'; $web.Size = '585,295'
+$web.AllowNavigation = $false
+$web.AllowWebBrowserDrop = $false
+$web.IsWebBrowserContextMenuEnabled = $false
+$web.WebBrowserShortcutsEnabled = $false
+$web.ScriptErrorsSuppressed = $true
+$grpPrev.Controls.Add($web)
+
+# -------------------------------------------------------------- Boutons d'action (refactorisés)
+$btnStart = New-Object System.Windows.Forms.Button
+$btnStart.Text = "Charger les prévisualisations"
+$btnStart.Location = '15,560'; $btnStart.Size = '230,36'
+$btnStart.BackColor = [System.Drawing.Color]::FromArgb(0, 90, 160)
+$btnStart.ForeColor = [System.Drawing.Color]::White
+$btnStart.FlatStyle = 'Flat'; $btnStart.Enabled = $false
+$form.Controls.Add($btnStart)
+
+$btnSendAll = New-Object System.Windows.Forms.Button
+$btnSendAll.Text = "Envoyer tous les mails"
+$btnSendAll.Location = '255,560'; $btnSendAll.Size = '200,36'
+$btnSendAll.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 90)
+$btnSendAll.ForeColor = [System.Drawing.Color]::White
+$btnSendAll.FlatStyle = 'Flat'; $btnSendAll.Enabled = $false
+$form.Controls.Add($btnSendAll)
+
+$btnCancel = New-Object System.Windows.Forms.Button
+$btnCancel.Text = "Annuler"
+$btnCancel.Location = '465,560'; $btnCancel.Size = '100,36'
+$form.Controls.Add($btnCancel)
+$btnCancel.Add_Click({ $form.Close() })
+
+$progress = New-Object System.Windows.Forms.ProgressBar
+$progress.Location = '575,567'; $progress.Size = '305,22'
+$form.Controls.Add($progress)
+
+# ----------------------------------------------------------------------- Journal
+$txtLog = New-Object System.Windows.Forms.TextBox
+$txtLog.Location = '15,604'; $txtLog.Size = '865,70'
+$txtLog.Multiline = $true; $txtLog.ScrollBars = 'Vertical'; $txtLog.ReadOnly = $true
+$txtLog.Font = New-Object System.Drawing.Font("Consolas", 8.5)
+$form.Controls.Add($txtLog)
+
+function Write-Log {
+    param([string]$Message)
+    $txtLog.AppendText(("[{0}] {1}`r`n" -f (Get-Date -Format 'HH:mm:ss'), $Message))
+}
+
+# ==============================================================================
+# 3. ÉTAT DE LA CAMPAGNE
+# ==============================================================================
+$script:donnees         = $null    # lignes du CSV
+$script:index           = -1       # index de la ligne en cours de prévisualisation
+$script:stats           = @{ OK = 0; KO = 0; Passes = 0 }
+$script:envoiEffectues  = @()      # liste des envois pour la preuve
+
+# ==============================================================================
+# 4. FONCTIONS DE PILOTAGE DE LA CAMPAGNE
+# ==============================================================================
+
+function Get-LigneCourante { return $script:donnees[$script:index] }
+
+function Get-ChampsLigne {
+    <# Extrait (email, nom, cheminQR) de la ligne courante selon le mapping GUI. #>
+    $ligne = Get-LigneCourante
+    return @{
+        Email    = ([string]$ligne.($combos['Email'].SelectedItem)).Trim()
+        Nom      = if ($combos['Nom'].SelectedItem) { ([string]$ligne.($combos['Nom'].SelectedItem)).Trim() } else { "" }
+        CheminQR = ([string]$ligne.($combos['CheminQR'].SelectedItem)).Trim()
+    }
+}
+
+function Show-Apercu {
+    <#
+        Affiche la prévisualisation du mail pour le destinataire à l'index $script:index.
+        N'AFFECTE PAS le contenu du ListBox (pour éviter la récursion infinie via
+        l'événement SelectedIndexChanged).
+    #>
+    if ($script:index -lt 0 -or $script:index -ge $script:donnees.Count) { ret
