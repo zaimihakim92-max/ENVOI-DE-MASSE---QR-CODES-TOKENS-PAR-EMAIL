@@ -124,6 +124,31 @@ Add-Type -AssemblyName System.Drawing
 # 1. FONCTIONS
 # ==============================================================================
 
+function Detect-CsvDelimiter {
+    <#
+        Détecte le délimiteur d'un fichier CSV automatiquement
+        Teste en ordre : ; (France) → , (US) → TAB → espace
+        Retourne le délimiteur détecté
+    #>
+    param([string]$FilePath)
+    
+    try {
+        $firstLine = Get-Content $FilePath -TotalCount 1 -Encoding UTF8
+        
+        # Tester les délimiteurs courants (ordre de priorité)
+        if ($firstLine -like "*;*") { return ";" }        # Point-virgule (France)
+        if ($firstLine -like "*,*") { return "," }        # Virgule (US)
+        if ($firstLine -like "*`t*") { return "`t" }      # TAB
+        if ($firstLine -like "* *") { return " " }        # Espace
+        
+        return ";"  # Par défaut
+    }
+    catch {
+        Write-Log "⚠️ Erreur détection délimiteur : $($_.Exception.Message) → par défaut ';'"
+        return ";"
+    }
+}
+
 function Send-QRMail {
     <#
         Envoie UN mail avec le QR code en image inline (Content-ID).
@@ -388,21 +413,75 @@ $listbox.Add_SelectedIndexChanged({
 
 # Sauvegarder la référence de l'événement pour pouvoir le déconnecter dans Update-ListboxItemStatus
 $script:listboxEventHandler = $listbox.SelectedIndexChanged.GetInvocationList()[-1]
+
+# Initialiser les variables de splitter
 $script:splitterX = 267
 $script:splitterIsDragging = $false
 $script:splitterStartX = 0
 
-# --- Préviz HTML du mail sélectionné (droite) ------------------------------------
+# --- TabControl pour afficher Données+QR ou Aperçu Mail ---
+$tabControl = New-Object System.Windows.Forms.TabControl
+$tabControl.Location = '270,22'; $tabControl.Size = '585,295'
+$grpPrev.Controls.Add($tabControl)
+
+# TAB 1 : Données & QR
+$tabDonnees = New-Object System.Windows.Forms.TabPage
+$tabDonnees.Text = "📋 Données & QR"
+$tabControl.TabPages.Add($tabDonnees)
+
+# DataGridView pour les données
+$dgvDonnees = New-Object System.Windows.Forms.DataGridView
+$dgvDonnees.Location = '0,0'; $dgvDonnees.Size = '585,130'
+$dgvDonnees.AllowUserToAddRows = $false
+$dgvDonnees.AllowUserToDeleteRows = $false
+$dgvDonnees.ReadOnly = $true
+$dgvDonnees.ColumnHeadersHeightSizeMode = [System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode]::AutoSize
+$dgvDonnees.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$dgvDonnees.BackgroundColor = [System.Drawing.Color]::White
+$dgvDonnees.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+$dgvDonnees.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::AllCells
+$tabDonnees.Controls.Add($dgvDonnees)
+
+# Panel pour QR code (bas)
+$pnlQR = New-Object System.Windows.Forms.Panel
+$pnlQR.Location = '0,130'; $pnlQR.Size = '585,155'
+$pnlQR.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$pnlQR.BackColor = [System.Drawing.Color]::White
+$pnlQR.AutoScroll = $true
+$tabDonnees.Controls.Add($pnlQR)
+
+# PictureBox pour afficher le QR code
+$picQR = New-Object System.Windows.Forms.PictureBox
+$picQR.Location = '5,5'; $picQR.Size = '150,150'
+$picQR.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
+$picQR.BackColor = [System.Drawing.Color]::White
+$picQR.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$pnlQR.Controls.Add($picQR)
+
+# Label pour infos QR
+$lblQRInfo = New-Object System.Windows.Forms.Label
+$lblQRInfo.Location = '160,5'; $lblQRInfo.Size = '415,150'
+$lblQRInfo.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$lblQRInfo.AutoSize = $false
+$lblQRInfo.Text = ""
+$pnlQR.Controls.Add($lblQRInfo)
+
+# TAB 2 : Aperçu Mail
+$tabMail = New-Object System.Windows.Forms.TabPage
+$tabMail.Text = "📧 Aperçu Mail"
+$tabControl.TabPages.Add($tabMail)
+
+# Préviz HTML du mail sélectionné
 $web = New-Object System.Windows.Forms.WebBrowser
-$web.Location = '270,22'; $web.Size = '585,295'
+$web.Location = '0,0'; $web.Size = '585,295'
 $web.AllowNavigation = $false
 $web.AllowWebBrowserDrop = $false
 $web.IsWebBrowserContextMenuEnabled = $false
 $web.WebBrowserShortcutsEnabled = $false
 $web.ScriptErrorsSuppressed = $true
-$grpPrev.Controls.Add($web)
+$tabMail.Controls.Add($web)
 
-# Redimensionnement par drag-and-drop sur la limite entre ListBox et WebBrowser
+# Redimensionnement par drag-and-drop sur la limite entre ListBox et TabControl
 $grpPrev.Add_MouseDown({
     param($sender, $e)
     if ($e.X -ge 265 -and $e.X -le 275 -and $e.Y -ge 22 -and $e.Y -le 295) {
@@ -552,6 +631,54 @@ function Show-Apercu {
 
     $html = (($ModeleCorps -replace '\{NOM\}', $c.Nom) -replace '\{QR\}', $imgPrev) -replace '\{SIGNATURE\}', $sigPrev
     $web.DocumentText = $html
+
+    # === AFFICHER LES DONNÉES ET LE QR CODE DANS LE TAB "Données & QR" ===
+    
+    # Remplir le DataGridView avec les données du destinataire
+    $dgvDonnees.DataSource = $null
+    $dgvDonnees.Rows.Clear()
+    $dgvDonnees.Columns.Clear()
+    
+    # Ajouter colonnes
+    $dgvDonnees.Columns.Add("Champ", "Champ") | Out-Null
+    $dgvDonnees.Columns.Add("Valeur", "Valeur") | Out-Null
+    
+    # Remplir les lignes avec toutes les colonnes de l'utilisateur
+    foreach ($prop in $c.PSObject.Properties) {
+        $dgvDonnees.Rows.Add($prop.Name, $prop.Value) | Out-Null
+    }
+    
+    # Formater le DataGridView
+    $dgvDonnees.Columns[0].Width = 150
+    $dgvDonnees.Columns[1].Width = 430
+    $dgvDonnees.AutoResizeRowHeadersWidth([System.Windows.Forms.DataGridViewAutoSizeRowHeadersWidthStyle]::AutoSizeToAllHeaders)
+    
+    # Afficher l'image QR
+    if ($qrOk) {
+        try {
+            $picQR.Image = [System.Drawing.Image]::FromFile($c.CheminQR)
+            $lblQRInfo.Text = "✓ QR Code : $([System.IO.Path]::GetFileName($c.CheminQR))`n`nToken : $($c.Token)`n`n(Double-clic pour ouvrir)"
+        }
+        catch {
+            $picQR.Image = $null
+            $lblQRInfo.Text = "❌ Erreur lecture QR`n`n$($_.Exception.Message)"
+        }
+    } else {
+        $picQR.Image = $null
+        $lblQRInfo.Text = "⚠️ QR Code INTROUVABLE`n`nChemin attendu :`n$($c.CheminQR)"
+    }
+    
+    # Event pour double-clic sur QR = ouvre le fichier
+    if ($qrOk) {
+        $picQR.Add_DoubleClick({
+            try {
+                [System.Diagnostics.Process]::Start($c.CheminQR)
+            }
+            catch {
+                [System.Windows.Forms.MessageBox]::Show("Impossible d'ouvrir : $($_.Exception.Message)", "Erreur", 'OK', 'Error')
+            }
+        })
+    }
 
     $progress.Maximum = $script:donnees.Count
     $progress.Value   = $num
@@ -834,9 +961,13 @@ $btnCsv.Add_Click({
 
     $txtCsv.Text = $ofd.FileName
 
-    # Import en UTF-8, repli sur l'encodage par défaut (ANSI) si échec
-    try   { $script:donnees = @(Import-Csv -Path $ofd.FileName -Delimiter ';' -Encoding UTF8) }
-    catch { $script:donnees = @(Import-Csv -Path $ofd.FileName -Delimiter ';') }
+    # Détection AUTOMATIQUE du délimiteur (;, ,, TAB, espace)
+    $delimiter = Detect-CsvDelimiter -FilePath $ofd.FileName
+    Write-Log "✓ Délimiteur détecté : $(if ($delimiter -eq ';') { 'Point-virgule' } elseif ($delimiter -eq ',') { 'Virgule' } elseif ($delimiter -eq "`t") { 'TAB' } else { 'Espace' })"
+    
+    # Import en UTF-8 avec délimiteur détecté, repli sur l'encodage par défaut (ANSI) si échec
+    try   { $script:donnees = @(Import-Csv -Path $ofd.FileName -Delimiter $delimiter -Encoding UTF8) }
+    catch { $script:donnees = @(Import-Csv -Path $ofd.FileName -Delimiter $delimiter) }
 
     if (-not $script:donnees -or $script:donnees.Count -eq 0) {
         Write-Log "ERREUR : CSV vide ou illisible."
